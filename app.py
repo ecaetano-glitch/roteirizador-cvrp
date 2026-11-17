@@ -45,14 +45,17 @@ def matriz_distancias(coords):
     try:
         pts = ";".join(f"{lon},{lat}" for lat, lon in coords)
         r = requests.get(f"{OSRM}/table/v1/driving/{pts}",
-                         params={"annotations": "distance"}, timeout=30)
-        m = r.json()["distances"]
-        return [[int(round(x)) for x in linha] for linha in m], "OSRM (ruas)"
+                         params={"annotations": "distance,duration"}, timeout=30)
+        j = r.json()
+        m = [[int(round(x)) for x in linha] for linha in j["distances"]]
+        t = [[int(round(x)) for x in linha] for linha in j["durations"]]
+        return m, t, "OSRM (ruas)"
     except Exception:
         n = len(coords)
         m = [[int(geodesic(coords[i], coords[j]).meters) for j in range(n)]
              for i in range(n)]
-        return m, "Distancia em linha reta (OSRM indisponivel)"
+        t = [[int(x / 8.3) for x in linha] for linha in m]  # ~30 km/h (estimativa)
+        return m, t, "Distancia em linha reta e tempo estimado a 30 km/h (OSRM indisponivel)"
 
 
 def tracado_osrm(a, b):
@@ -173,8 +176,9 @@ if ss.etapa == 1:
             st.error("Nao consegui geocodificar: " + "; ".join(falhas) +
                      ". Tente completar rua, numero, cidade e estado.")
             st.stop()
-        dist, fonte = matriz_distancias(coords)
-        ss.update(df_pontos=df, coords=coords, dist=dist, fonte_dist=fonte, etapa=2)
+        dist, dur, fonte = matriz_distancias(coords)
+        ss.update(df_pontos=df, coords=coords, dist=dist, dur=dur,
+                  fonte_dist=fonte, etapa=2)
         st.rerun()
 
 # ---------------------------------------------------------------- ETAPA 2
@@ -187,6 +191,8 @@ elif ss.etapa == 2:
                                "Quantidade": [3]})
     frota_df = st.data_editor(ss.get("frota_df", frota_base), num_rows="dynamic",
                               use_container_width=True, key="editor_frota")
+    ss.custo_km = st.number_input("Custo por km rodado (R$)", 0.0, 100.0,
+                                  float(ss.get("custo_km", 2.50)), step=0.10)
     ss.limite = st.number_input("Tempo limite do solver (segundos)", 5, 600,
                                 ss.get("limite", 60))
     c1, c2 = st.columns(2)
@@ -212,7 +218,7 @@ elif ss.etapa == 2:
 # ---------------------------------------------------------------- ETAPA 3
 else:
     st.title("Etapa 3: Roteamento")
-    df, coords, dist = ss.df_pontos, ss.coords, ss.dist
+    df, coords, dist, dur = ss.df_pontos, ss.coords, ss.dist, ss.dur
     demandas = df["Demanda"].astype(int).tolist()
     frota = [{"nome": r.Nome, "capacidade": r.Capacidade, "quantidade": r.Quantidade}
              for r in ss.frota_df.itertuples()]
@@ -236,7 +242,8 @@ else:
         st.error("O solver nao encontrou solucao viavel.")
     else:
         st.caption(f"Solver: {ss.solver}")
-        linhas, total = [], 0
+        linhas, total, total_t = [], 0, 0
+        custo_km = ss.get("custo_km", 0.0)
         mapa = folium.Map(location=coords[0], zoom_start=13)
         folium.Marker(coords[0], tooltip="Deposito",
                       icon=folium.Icon(color="black", icon="home")).add_to(mapa)
@@ -244,9 +251,13 @@ else:
             cor = CORES[k % len(CORES)]
             d = sum(dist[a][b] for a, b in zip(rota, rota[1:]))
             carga = sum(demandas[i] for i in rota)
+            tempo = sum(dur[a][b] for a, b in zip(rota, rota[1:]))
             total += d
+            total_t += tempo
             linhas.append({"Rota": k + 1, "Sequencia": " -> ".join(map(str, rota)),
-                           "Carga": carga, "Distancia (km)": round(d / 1000, 2)})
+                           "Carga": carga, "Distancia (km)": round(d / 1000, 2),
+                           "Tempo (min)": round(tempo / 60),
+                           "Custo (R$)": round(d / 1000 * custo_km, 2)})
             for a, b in zip(rota, rota[1:]):
                 folium.PolyLine(tracado_osrm(coords[a], coords[b]),
                                 color=cor, weight=5, opacity=0.8).add_to(mapa)
@@ -259,6 +270,9 @@ else:
             st_folium(mapa, width=800, height=550, returned_objects=[])
         with c2:
             st.metric("Distancia total", f"{total / 1000:.2f} km")
+            st.metric("Custo total", f"R$ {total / 1000 * custo_km:,.2f}")
+            st.metric("Tempo total de viagem", f"{total_t / 3600:.1f} h" if total_t >= 3600
+                      else f"{total_t / 60:.0f} min")
             st.metric("Veiculos usados", len(rotas))
             if ss.info:
                 v, lb = ss.info["valor"], ss.info["lb"]
@@ -271,7 +285,7 @@ else:
                 f"{i}={df['Endereco'][i]}" for i in range(1, len(df))))
 
     if st.button("Recomecar"):
-        for k in ("df_pontos", "coords", "dist", "frota_df", "rotas"):
+        for k in ("df_pontos", "coords", "dist", "dur", "frota_df", "rotas"):
             ss.pop(k, None)
         ss.etapa = 1
         st.rerun()
